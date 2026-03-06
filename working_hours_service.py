@@ -1,14 +1,24 @@
 import json
 import os
-import sqlite3
 from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
 
 from flask import Flask, Response, jsonify, request
 
-from audit_utils import default_operator, ensure_schema, fetch_history, log_change, snapshot_from_row
-from export_utils import export_excel_report
+from audit_utils import default_operator
+from data_backend import (
+    create_entry,
+    delete_entry,
+    fetch_all_entries,
+    fetch_entries,
+    fetch_filters,
+    fetch_history_rows,
+    fetch_monthly_summary,
+    init_backend,
+    update_entry,
+)
+from export_utils import export_excel_report_from_data
 
 
 ALL_PROJECTS = "All Projects"
@@ -17,58 +27,7 @@ DB_PATH = (Path("/tmp") / "worklog.db") if os.environ.get("VERCEL") else (BASE_D
 
 
 app = Flask(__name__)
-
-
-def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    ensure_schema(conn)
-    return conn
-
-
-def fetch_filters(conn: sqlite3.Connection) -> dict:
-    months = [
-        row["month_key"]
-        for row in conn.execute(
-            """
-            SELECT DISTINCT substr(work_date, 1, 7) AS month_key
-            FROM work_entries
-            ORDER BY month_key DESC
-            """
-        )
-    ]
-    projects = [
-        row["project_name"]
-        for row in conn.execute(
-            "SELECT DISTINCT project_name FROM work_entries ORDER BY project_name COLLATE NOCASE"
-        )
-    ]
-    return {"months": months, "projects": projects}
-
-
-def fetch_entries(conn: sqlite3.Connection, month: str, project: str) -> list[dict]:
-    query = """
-        SELECT id, work_date, employee_name, project_name, task_name, hours_spent
-        FROM work_entries
-        WHERE substr(work_date, 1, 7) = ?
-    """
-    params: list[str] = [month]
-    if project and project != ALL_PROJECTS:
-        query += " AND project_name = ?"
-        params.append(project)
-    query += " ORDER BY work_date DESC, id DESC"
-    rows = conn.execute(query, params).fetchall()
-    return [
-        {
-            "id": row["id"],
-            "work_date": row["work_date"],
-            "employee_name": row["employee_name"],
-            "project_name": row["project_name"],
-            "task_name": row["task_name"],
-            "hours_spent": float(row["hours_spent"]),
-        }
-        for row in rows
-    ]
+init_backend(DB_PATH)
 
 
 def build_summary(entries: list[dict]) -> dict:
@@ -118,17 +77,15 @@ def index() -> Response:
 
 @app.get("/api/filters")
 def api_filters():
-    with get_connection() as conn:
-        return jsonify(fetch_filters(conn))
+    return jsonify(fetch_filters(DB_PATH))
 
 
 @app.get("/api/dashboard")
 def api_dashboard():
     month = request.args.get("month") or date.today().strftime("%Y-%m")
     project = request.args.get("project") or ALL_PROJECTS
-    with get_connection() as conn:
-        entries = fetch_entries(conn, month, project)
-        history = [dict(row) for row in fetch_history(conn, month=month, project=project, limit=40)]
+    entries = fetch_entries(DB_PATH, month, project)
+    history = fetch_history_rows(DB_PATH, month=month, project=project, limit=40)
     return jsonify({"entries": entries, "summary": build_summary(entries), "history": history})
 
 
@@ -148,17 +105,7 @@ def api_create_entry():
         "hours_spent": round(float(payload["hours_spent"]), 2),
     }
 
-    with get_connection() as conn:
-        conn.execute(
-            """
-            INSERT INTO work_entries (employee_name, work_date, project_name, task_name, hours_spent)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (values["employee_name"], values["work_date"], values["project_name"], values["task_name"], values["hours_spent"]),
-        )
-        entry_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
-        log_change(conn, entry_id=entry_id, action="CREATE", changed_by=operator, new_values=values)
-        conn.commit()
+    create_entry(DB_PATH, values, operator)
     return jsonify({"status": "ok"}), 201
 
 
@@ -178,34 +125,8 @@ def api_update_entry(entry_id: int):
         "hours_spent": round(float(payload["hours_spent"]), 2),
     }
 
-    with get_connection() as conn:
-        old_row = conn.execute(
-            """
-            SELECT employee_name, work_date, project_name, task_name, hours_spent
-            FROM work_entries
-            WHERE id = ?
-            """,
-            (entry_id,),
-        ).fetchone()
-        if old_row is None:
-            return jsonify({"error": "Entry not found."}), 404
-        conn.execute(
-            """
-            UPDATE work_entries
-            SET employee_name = ?, work_date = ?, project_name = ?, task_name = ?, hours_spent = ?
-            WHERE id = ?
-            """,
-            (values["employee_name"], values["work_date"], values["project_name"], values["task_name"], values["hours_spent"], entry_id),
-        )
-        log_change(
-            conn,
-            entry_id=entry_id,
-            action="UPDATE",
-            changed_by=operator,
-            old_values=snapshot_from_row(old_row),
-            new_values=values,
-        )
-        conn.commit()
+    if not update_entry(DB_PATH, entry_id, values, operator):
+        return jsonify({"error": "Entry not found."}), 404
     return jsonify({"status": "ok"})
 
 
@@ -216,26 +137,8 @@ def api_delete_entry(entry_id: int):
     if not operator:
         return jsonify({"error": "Please enter the operator name."}), 400
 
-    with get_connection() as conn:
-        old_row = conn.execute(
-            """
-            SELECT employee_name, work_date, project_name, task_name, hours_spent
-            FROM work_entries
-            WHERE id = ?
-            """,
-            (entry_id,),
-        ).fetchone()
-        if old_row is None:
-            return jsonify({"error": "Entry not found."}), 404
-        conn.execute("DELETE FROM work_entries WHERE id = ?", (entry_id,))
-        log_change(
-            conn,
-            entry_id=entry_id,
-            action="DELETE",
-            changed_by=operator,
-            old_values=snapshot_from_row(old_row),
-        )
-        conn.commit()
+    if not delete_entry(DB_PATH, entry_id, operator):
+        return jsonify({"error": "Entry not found."}), 404
     return jsonify({"status": "ok"})
 
 
@@ -243,7 +146,16 @@ def api_delete_entry(entry_id: int):
 def api_export_excel():
     month = request.args.get("month") or date.today().strftime("%Y-%m")
     project = request.args.get("project") or ALL_PROJECTS
-    file_bytes = export_excel_report(DB_PATH, month=month, project=project)
+    all_entries = fetch_all_entries(DB_PATH)
+    filtered_entries = fetch_entries(DB_PATH, month, project)
+    monthly_summary = fetch_monthly_summary(DB_PATH)
+    file_bytes = export_excel_report_from_data(
+        all_entries=all_entries,
+        filtered_entries=filtered_entries,
+        monthly_summary=monthly_summary,
+        month=month,
+        project=project,
+    )
     file_name = f"working-hours-report-{date.today().isoformat()}.xlsx"
     return Response(
         file_bytes,

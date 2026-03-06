@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from io import BytesIO
 from pathlib import Path
+from typing import Mapping
 
 from audit_utils import ensure_schema
 from openpyxl import Workbook
@@ -21,35 +22,51 @@ def export_excel_report(db_path: Path, month: str | None = None, project: str | 
     conn.row_factory = sqlite3.Row
     try:
         _ensure_table(conn)
-        workbook = Workbook()
-        workbook.remove(workbook.active)
-
         all_entries = _fetch_all_entries(conn)
         filtered_entries = _fetch_filtered_entries(conn, month, project)
-        project_summary = _summarize_filtered(filtered_entries, "project_name")
-        employee_summary = _summarize_filtered(filtered_entries, "employee_name")
         monthly_summary = _fetch_monthly_summary(conn)
-
-        _add_sheet(
-            workbook,
-            "All Entries",
-            ["Date", "Employee", "Project", "Task", "Hours"],
-            [[row["work_date"], row["employee_name"], row["project_name"], row["task_name"], row["hours_spent"]] for row in all_entries],
+        return export_excel_report_from_data(
+            all_entries=[dict(row) for row in all_entries],
+            filtered_entries=[dict(row) for row in filtered_entries],
+            monthly_summary=monthly_summary,
+            month=month,
+            project=project,
         )
-        _add_sheet(
-            workbook,
-            "Current View",
-            ["Date", "Employee", "Project", "Task", "Hours"],
-            [[row["work_date"], row["employee_name"], row["project_name"], row["task_name"], row["hours_spent"]] for row in filtered_entries],
-        )
-        _add_statistics_sheet(workbook, month, project, project_summary, employee_summary)
-        _add_sheet(workbook, "Monthly Summary", ["Month", "Entries", "Total Hours"], monthly_summary)
-
-        stream = BytesIO()
-        workbook.save(stream)
-        return stream.getvalue()
     finally:
         conn.close()
+
+
+def export_excel_report_from_data(
+    all_entries: list[Mapping[str, object]],
+    filtered_entries: list[Mapping[str, object]],
+    monthly_summary: list[list],
+    month: str | None = None,
+    project: str | None = None,
+) -> bytes:
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+
+    project_summary = _summarize_filtered(filtered_entries, "project_name")
+    employee_summary = _summarize_filtered(filtered_entries, "employee_name")
+
+    _add_sheet(
+        workbook,
+        "All Entries",
+        ["Date", "Employee", "Project", "Task", "Hours"],
+        [[row["work_date"], row["employee_name"], row["project_name"], row["task_name"], row["hours_spent"]] for row in all_entries],
+    )
+    _add_sheet(
+        workbook,
+        "Current View",
+        ["Date", "Employee", "Project", "Task", "Hours"],
+        [[row["work_date"], row["employee_name"], row["project_name"], row["task_name"], row["hours_spent"]] for row in filtered_entries],
+    )
+    _add_statistics_sheet(workbook, month, project, project_summary, employee_summary)
+    _add_sheet(workbook, "Monthly Summary", ["Month", "Entries", "Total Hours"], monthly_summary)
+
+    stream = BytesIO()
+    workbook.save(stream)
+    return stream.getvalue()
 
 
 def _ensure_table(conn: sqlite3.Connection) -> None:
@@ -87,10 +104,10 @@ def _fetch_monthly_summary(conn: sqlite3.Connection) -> list[list]:
     return [[row["month_key"], row["entry_count"], row["total_hours"]] for row in rows]
 
 
-def _summarize_filtered(rows: list[sqlite3.Row], key: str) -> list[list]:
+def _summarize_filtered(rows: list[Mapping[str, object]], key: str) -> list[list]:
     summary: dict[str, list[float]] = {}
     for row in rows:
-        label = row[key]
+        label = str(row[key])
         if label not in summary:
             summary[label] = [0, 0.0]
         summary[label][0] += 1

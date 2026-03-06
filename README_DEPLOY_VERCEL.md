@@ -1,43 +1,40 @@
 # Working Hours Web - Deploy Notes
 
-## 1) Files prepared in this folder
-- `webapp.py`
-- `audit_utils.py`
-- `export_utils.py`
-- `worklog.db` (optional seed data)
+## 1) Stable mode on Vercel (Supabase Postgres)
+This app now supports two backends:
+- Local development fallback: SQLite (`worklog.db`)
+- Production stable: Postgres via `SUPABASE_DB_URL` (or `DATABASE_URL`)
 
-## 2) Important limitation on Vercel
-This app uses local SQLite (`worklog.db`) for create/update/delete operations.
-On Vercel serverless, local filesystem is ephemeral and not persistent for writes.
+If `SUPABASE_DB_URL` is set to a Postgres URL, the app will use Supabase and data is persistent.
 
-That means:
-- Reads from bundled file may work.
-- Writes (save/edit/delete) are not reliable/persistent.
+## 2) Required environment variables on Vercel
+In Vercel project settings, add:
+- `SUPABASE_DB_URL` = your Supabase Postgres connection string
 
-For real use, move data to a hosted DB (Supabase Postgres, Neon, PlanetScale, etc).
+Then redeploy. The app will auto-create tables (`work_entries`, `change_history`) on first run.
 
-## 3) Push to GitHub
+## 3) Optional one-time migration from SQLite to Supabase
+Run locally in this folder:
+
+```powershell
+cd "d:\03. LEARNING\0. Python\00. CODE TEST\Kudo\working-hours-web-vercel"
+python -m pip install -r requirements.txt
+$env:SUPABASE_DB_URL="<your_supabase_postgres_url>"
+python migrate_sqlite_to_supabase.py
+```
+
+## 4) Push to GitHub
 Run in this folder:
 
 ```powershell
 cd "d:\03. LEARNING\0. Python\00. CODE TEST\Kudo\working-hours-web-vercel"
-git init
 git add .
-git commit -m "Init working-hours web deploy folder"
-git branch -M main
-git remote add origin <YOUR_GITHUB_REPO_URL>
-git push -u origin main
+git commit -m "Migrate Working Hours backend to Supabase-ready mode"
+git push origin main
 ```
 
-## 4) Deploy on Vercel
+## 5) Deploy on Vercel
 1. Login Vercel: https://vercel.com
-2. Click `Add New...` -> `Project`
-3. Import your GitHub repository
-4. Framework Preset: `Other`
-5. Root Directory: this repo root
-6. Click `Deploy`
-
-## 5) Recommended production path
-- Keep Vercel for frontend.
-- Replace SQLite with hosted DB.
-- Refactor `webapp.py` from local `http.server` style to serverless-compatible API routes.
+2. Open your project connected to this GitHub repo
+3. Add `SUPABASE_DB_URL` in Environment Variables
+4. Trigger a new deploy from latest `main`
