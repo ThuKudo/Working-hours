@@ -19,6 +19,7 @@ def ensure_pg_schema(conn) -> None:
             """
             CREATE TABLE IF NOT EXISTS work_entries (
                 id BIGSERIAL PRIMARY KEY,
+                legacy_sqlite_id BIGINT,
                 employee_name TEXT NOT NULL,
                 work_date TEXT NOT NULL,
                 project_name TEXT NOT NULL,
@@ -32,6 +33,7 @@ def ensure_pg_schema(conn) -> None:
             """
             CREATE TABLE IF NOT EXISTS change_history (
                 id BIGSERIAL PRIMARY KEY,
+                legacy_sqlite_history_id BIGINT,
                 entry_id BIGINT,
                 action TEXT NOT NULL,
                 changed_by TEXT NOT NULL,
@@ -45,6 +47,14 @@ def ensure_pg_schema(conn) -> None:
                 changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """
+        )
+        cur.execute("ALTER TABLE work_entries ADD COLUMN IF NOT EXISTS legacy_sqlite_id BIGINT")
+        cur.execute("ALTER TABLE change_history ADD COLUMN IF NOT EXISTS legacy_sqlite_history_id BIGINT")
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_work_entries_legacy_sqlite_id ON work_entries (legacy_sqlite_id) WHERE legacy_sqlite_id IS NOT NULL;"
+        )
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_change_history_legacy_sqlite_id ON change_history (legacy_sqlite_history_id) WHERE legacy_sqlite_history_id IS NOT NULL;"
         )
     conn.commit()
 
@@ -68,7 +78,7 @@ def main() -> None:
         ).fetchall()
         history_rows = sqlite_conn.execute(
             """
-            SELECT entry_id, action, changed_by, employee_name, work_date, project_name, task_name, hours_spent, old_values, new_values
+            SELECT id, entry_id, action, changed_by, employee_name, work_date, project_name, task_name, hours_spent, old_values, new_values
             FROM change_history
             ORDER BY id ASC
             """
@@ -77,22 +87,24 @@ def main() -> None:
     with psycopg.connect(SUPABASE_DB_URL) as pg_conn:
         ensure_pg_schema(pg_conn)
         with pg_conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT COUNT(*) AS c FROM work_entries")
-            existing_entries = int(cur.fetchone()["c"])
-            cur.execute("SELECT COUNT(*) AS c FROM change_history")
-            existing_history = int(cur.fetchone()["c"])
-            if existing_entries > 0 or existing_history > 0:
-                raise SystemExit("Target Postgres is not empty. Stop to avoid duplicate migration.")
-
             id_map: dict[int, int] = {}
+            inserted_entries = 0
+            updated_entries = 0
             for row in entries:
                 cur.execute(
                     """
-                    INSERT INTO work_entries (employee_name, work_date, project_name, task_name, hours_spent)
-                    VALUES (%s, %s, %s, %s, %s)
-                    RETURNING id
+                    INSERT INTO work_entries (legacy_sqlite_id, employee_name, work_date, project_name, task_name, hours_spent)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (legacy_sqlite_id) DO UPDATE
+                    SET employee_name = EXCLUDED.employee_name,
+                        work_date = EXCLUDED.work_date,
+                        project_name = EXCLUDED.project_name,
+                        task_name = EXCLUDED.task_name,
+                        hours_spent = EXCLUDED.hours_spent
+                    RETURNING id, (xmax = 0) AS inserted
                     """,
                     (
+                        int(row["id"]),
                         row["employee_name"],
                         row["work_date"],
                         row["project_name"],
@@ -100,20 +112,40 @@ def main() -> None:
                         float(row["hours_spent"]),
                     ),
                 )
-                new_id = int(cur.fetchone()["id"])
+                result = cur.fetchone()
+                new_id = int(result["id"])
+                if bool(result["inserted"]):
+                    inserted_entries += 1
+                else:
+                    updated_entries += 1
                 id_map[int(row["id"])] = new_id
 
+            inserted_history = 0
+            updated_history = 0
             for row in history_rows:
                 old_entry_id = row["entry_id"]
                 mapped_entry_id = id_map.get(int(old_entry_id)) if old_entry_id is not None else None
                 cur.execute(
                     """
                     INSERT INTO change_history (
-                        entry_id, action, changed_by, employee_name, work_date, project_name, task_name, hours_spent, old_values, new_values
+                        legacy_sqlite_history_id, entry_id, action, changed_by, employee_name, work_date, project_name, task_name, hours_spent, old_values, new_values
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+                    ON CONFLICT (legacy_sqlite_history_id) DO UPDATE
+                    SET entry_id = EXCLUDED.entry_id,
+                        action = EXCLUDED.action,
+                        changed_by = EXCLUDED.changed_by,
+                        employee_name = EXCLUDED.employee_name,
+                        work_date = EXCLUDED.work_date,
+                        project_name = EXCLUDED.project_name,
+                        task_name = EXCLUDED.task_name,
+                        hours_spent = EXCLUDED.hours_spent,
+                        old_values = EXCLUDED.old_values,
+                        new_values = EXCLUDED.new_values
+                    RETURNING (xmax = 0) AS inserted
                     """,
                     (
+                        int(row["id"]),
                         mapped_entry_id,
                         row["action"],
                         row["changed_by"],
@@ -126,9 +158,18 @@ def main() -> None:
                         row["new_values"] or "{}",
                     ),
                 )
+                result = cur.fetchone()
+                if bool(result["inserted"]):
+                    inserted_history += 1
+                else:
+                    updated_history += 1
         pg_conn.commit()
 
-    print(f"Migrated {len(entries)} entries and {len(history_rows)} history rows.")
+    print(
+        "Migration synced successfully."
+        f" Entries inserted={inserted_entries}, updated={updated_entries};"
+        f" History inserted={inserted_history}, updated={updated_history}."
+    )
 
 
 if __name__ == "__main__":

@@ -23,6 +23,10 @@ $env:SUPABASE_DB_URL="<your_supabase_postgres_url>"
 python migrate_sqlite_to_supabase.py
 ```
 
+Migration behavior:
+- Keeps existing Supabase data.
+- Syncs by SQLite legacy IDs (upsert), so running again updates existing rows instead of duplicating.
+
 ## 4) Push to GitHub
 Run in this folder:
 

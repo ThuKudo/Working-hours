@@ -37,6 +37,7 @@ def _ensure_postgres_schema() -> None:
                 """
                 CREATE TABLE IF NOT EXISTS work_entries (
                     id BIGSERIAL PRIMARY KEY,
+                    legacy_sqlite_id BIGINT,
                     employee_name TEXT NOT NULL,
                     work_date TEXT NOT NULL,
                     project_name TEXT NOT NULL,
@@ -50,6 +51,7 @@ def _ensure_postgres_schema() -> None:
                 """
                 CREATE TABLE IF NOT EXISTS change_history (
                     id BIGSERIAL PRIMARY KEY,
+                    legacy_sqlite_history_id BIGINT,
                     entry_id BIGINT,
                     action TEXT NOT NULL,
                     changed_by TEXT NOT NULL,
@@ -63,6 +65,14 @@ def _ensure_postgres_schema() -> None:
                     changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
                 """
+            )
+            cur.execute("ALTER TABLE work_entries ADD COLUMN IF NOT EXISTS legacy_sqlite_id BIGINT")
+            cur.execute("ALTER TABLE change_history ADD COLUMN IF NOT EXISTS legacy_sqlite_history_id BIGINT")
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_work_entries_legacy_sqlite_id ON work_entries (legacy_sqlite_id) WHERE legacy_sqlite_id IS NOT NULL;"
+            )
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_change_history_legacy_sqlite_id ON change_history (legacy_sqlite_history_id) WHERE legacy_sqlite_history_id IS NOT NULL;"
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_work_entries_month ON work_entries (substring(work_date,1,7));")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_work_entries_project ON work_entries (project_name);")
