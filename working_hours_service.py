@@ -2,9 +2,11 @@ import json
 import os
 from collections import defaultdict
 from datetime import date, datetime
+from io import BytesIO
 from pathlib import Path
 
 from flask import Flask, Response, jsonify, request
+from openpyxl import load_workbook
 
 from audit_utils import default_operator
 from data_backend import (
@@ -15,6 +17,7 @@ from data_backend import (
     fetch_filters,
     fetch_history_rows,
     fetch_monthly_summary,
+    import_entries,
     init_backend,
     update_entry,
 )
@@ -67,6 +70,78 @@ def validate_payload(payload: dict) -> tuple[bool, str]:
     except (TypeError, ValueError):
         return False, "Hours must be a positive number."
     return True, ""
+
+
+def _normalize_header(value: object) -> str:
+    return str(value or "").strip().lower().replace(" ", "_")
+
+
+def _parse_import_rows(file_bytes: bytes) -> tuple[list[dict], str]:
+    workbook = load_workbook(filename=BytesIO(file_bytes), data_only=True, read_only=True)
+    sheet = workbook["All Entries"] if "All Entries" in workbook.sheetnames else workbook[workbook.sheetnames[0]]
+    rows = sheet.iter_rows(values_only=True)
+    try:
+        headers = next(rows)
+    except StopIteration:
+        return [], "Excel file is empty."
+
+    header_map = {_normalize_header(name): idx for idx, name in enumerate(headers)}
+    aliases = {
+        "work_date": ["work_date", "date"],
+        "employee_name": ["employee_name", "employee"],
+        "project_name": ["project_name", "project"],
+        "task_name": ["task_name", "task"],
+        "hours_spent": ["hours_spent", "hours"],
+    }
+    col_idx: dict[str, int] = {}
+    for key, keys in aliases.items():
+        matched = next((header_map[k] for k in keys if k in header_map), None)
+        if matched is None:
+            return [], f"Missing required column: {key}"
+        col_idx[key] = matched
+
+    parsed: list[dict] = []
+    errors: list[str] = []
+    for row_number, row in enumerate(rows, start=2):
+        raw = {k: row[v] if v < len(row) else None for k, v in col_idx.items()}
+        if not any(value not in (None, "") for value in raw.values()):
+            continue
+        work_date_value = raw["work_date"]
+        if isinstance(work_date_value, datetime):
+            work_date = work_date_value.strftime("%Y-%m-%d")
+        elif isinstance(work_date_value, date):
+            work_date = work_date_value.isoformat()
+        else:
+            work_date = str(work_date_value or "").strip()
+        employee_name = str(raw["employee_name"] or "").strip()
+        project_name = str(raw["project_name"] or "").strip()
+        task_name = str(raw["task_name"] or "").strip()
+        hours_raw = raw["hours_spent"]
+
+        try:
+            datetime.strptime(work_date, "%Y-%m-%d")
+            hours = round(float(hours_raw), 2)
+            if hours <= 0 or not employee_name or not project_name or not task_name:
+                raise ValueError
+        except (TypeError, ValueError):
+            errors.append(f"Invalid data at row {row_number}.")
+            continue
+
+        parsed.append(
+            {
+                "employee_name": employee_name,
+                "work_date": work_date,
+                "project_name": project_name,
+                "task_name": task_name,
+                "hours_spent": hours,
+            }
+        )
+
+    if errors:
+        return [], " ".join(errors[:5])
+    if not parsed:
+        return [], "No valid rows found in Excel file."
+    return parsed, ""
 
 
 @app.get("/")
@@ -140,6 +215,28 @@ def api_delete_entry(entry_id: int):
     if not delete_entry(DB_PATH, entry_id, operator):
         return jsonify({"error": "Entry not found."}), 404
     return jsonify({"status": "ok"})
+
+
+@app.post("/api/import.xlsx")
+def api_import_excel():
+    operator = str(request.form.get("operator_name", "")).strip()
+    if not operator:
+        return jsonify({"error": "Please enter the operator name."}), 400
+    upload = request.files.get("file")
+    if upload is None or not upload.filename:
+        return jsonify({"error": "Please choose an Excel file (.xlsx)."}), 400
+    if not upload.filename.lower().endswith(".xlsx"):
+        return jsonify({"error": "Only .xlsx files are supported."}), 400
+    try:
+        entries, error = _parse_import_rows(upload.read())
+    except Exception:
+        return jsonify({"error": "Could not read Excel file."}), 400
+    if error:
+        return jsonify({"error": error}), 400
+
+    overwrite = str(request.form.get("overwrite", "1")).strip().lower() in {"1", "true", "yes", "on"}
+    result = import_entries(DB_PATH, entries, operator, overwrite=overwrite)
+    return jsonify({"status": "ok", "result": result})
 
 
 @app.get("/api/export.xlsx")
@@ -220,6 +317,15 @@ HTML_PAGE = """
           <div><button id="refreshButton" type="button">Refresh</button></div>
         </div>
         <button id="exportButton" type="button" style="margin-top:8px;">Export Excel</button>
+        <div class="field" style="margin-top:8px;">
+          <label>Import Excel (.xlsx)</label>
+          <input id="importFile" type="file" accept=".xlsx" />
+        </div>
+        <label style="display:flex; align-items:center; gap:8px; margin-top:6px;">
+          <input id="overwriteImport" type="checkbox" checked style="width:auto; padding:0;" />
+          Overwrite duplicate records (same Date + Employee + Project + Task)
+        </label>
+        <button id="importButton" type="button" style="margin-top:8px; background:#4d7d5b;">Import Excel</button>
       </div>
       <div class="card" style="margin-bottom: 10px;">
         <div id="summary"></div>
@@ -274,6 +380,28 @@ document.getElementById("entryForm").addEventListener("submit", async (e)=>{
 
 document.getElementById("refreshButton").addEventListener("click", loadDashboard);
 document.getElementById("exportButton").addEventListener("click", ()=>{ const q=new URLSearchParams({month:state.month,project:state.project}); window.location.href=`/api/export.xlsx?${q.toString()}`; });
+document.getElementById("importButton").addEventListener("click", async ()=>{
+  const op=document.getElementById("operator_name").value.trim();
+  const fileInput=document.getElementById("importFile");
+  const file=fileInput.files && fileInput.files[0];
+  if(!op){ formStatus.textContent="Please enter the operator name."; formStatus.className="status error"; return; }
+  if(!file){ formStatus.textContent="Please choose an Excel file to import."; formStatus.className="status error"; return; }
+  const overwrite=document.getElementById("overwriteImport").checked;
+  if(!confirm(overwrite ? "Import file and overwrite duplicate records?" : "Import file without overwriting duplicates?")) return;
+  const fd=new FormData();
+  fd.append("file", file);
+  fd.append("operator_name", op);
+  fd.append("overwrite", overwrite ? "1" : "0");
+  const resp=await fetch("/api/import.xlsx",{method:"POST",body:fd});
+  const res=await resp.json();
+  if(!resp.ok){ formStatus.textContent=res.error||"Import failed."; formStatus.className="status error"; return; }
+  const r=res.result||{};
+  formStatus.textContent=`Import done. Created: ${r.created||0}, Updated: ${r.updated||0}, Skipped: ${r.skipped||0}.`;
+  formStatus.className="status";
+  fileInput.value="";
+  await initFilters();
+  await loadDashboard();
+});
 document.getElementById("monthFilter").addEventListener("change", async e=>{ state.month=e.target.value; await loadDashboard(); });
 document.getElementById("projectFilter").addEventListener("change", async e=>{ state.project=e.target.value; await loadDashboard(); });
 

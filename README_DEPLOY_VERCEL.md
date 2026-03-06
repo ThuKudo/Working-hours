@@ -27,6 +27,12 @@ Migration behavior:
 - Keeps existing Supabase data.
 - Syncs by SQLite legacy IDs (upsert), so running again updates existing rows instead of duplicating.
 
+## 3.1) Import from exported Excel
+- UI now has an `Import Excel` button.
+- You can import a previously exported `.xlsx` file (sheet `All Entries` or first sheet with matching headers).
+- Duplicate key is `Date + Employee + Project + Task`.
+- If `Overwrite duplicate records` is checked, duplicate rows update existing `Hours`.
+
 ## 4) Push to GitHub
 Run in this folder:
 

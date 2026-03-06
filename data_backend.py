@@ -438,6 +438,125 @@ def delete_entry(sqlite_db_path: Path, entry_id: int, operator: str) -> bool:
     return True
 
 
+def import_entries(sqlite_db_path: Path, entries: list[dict], operator: str, overwrite: bool = True) -> dict:
+    created = 0
+    updated = 0
+    skipped = 0
+
+    if USE_POSTGRES:
+        with psycopg.connect(SUPABASE_DB_URL) as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                for values in entries:
+                    cur.execute(
+                        """
+                        SELECT id, employee_name, work_date, project_name, task_name, hours_spent
+                        FROM work_entries
+                        WHERE employee_name = %s AND work_date = %s AND project_name = %s AND task_name = %s
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """,
+                        (values["employee_name"], values["work_date"], values["project_name"], values["task_name"]),
+                    )
+                    existing = cur.fetchone()
+                    if existing is None:
+                        cur.execute(
+                            """
+                            INSERT INTO work_entries (employee_name, work_date, project_name, task_name, hours_spent)
+                            VALUES (%s, %s, %s, %s, %s)
+                            RETURNING id
+                            """,
+                            (
+                                values["employee_name"],
+                                values["work_date"],
+                                values["project_name"],
+                                values["task_name"],
+                                values["hours_spent"],
+                            ),
+                        )
+                        entry_id = int(cur.fetchone()["id"])
+                        _insert_change_pg(cur, entry_id, "IMPORT_CREATE", operator, None, values)
+                        created += 1
+                        continue
+
+                    if not overwrite:
+                        skipped += 1
+                        continue
+
+                    old_values = {
+                        "employee_name": existing["employee_name"],
+                        "work_date": existing["work_date"],
+                        "project_name": existing["project_name"],
+                        "task_name": existing["task_name"],
+                        "hours_spent": float(existing["hours_spent"]),
+                    }
+                    if abs(float(old_values["hours_spent"]) - float(values["hours_spent"])) < 0.000001:
+                        skipped += 1
+                        continue
+                    cur.execute(
+                        """
+                        UPDATE work_entries
+                        SET hours_spent = %s
+                        WHERE id = %s
+                        """,
+                        (values["hours_spent"], int(existing["id"])),
+                    )
+                    _insert_change_pg(cur, int(existing["id"]), "IMPORT_OVERWRITE", operator, old_values, values)
+                    updated += 1
+            conn.commit()
+        return {"total_rows": len(entries), "created": created, "updated": updated, "skipped": skipped}
+
+    with _sqlite_connection(sqlite_db_path) as conn:
+        for values in entries:
+            row = conn.execute(
+                """
+                SELECT id, employee_name, work_date, project_name, task_name, hours_spent
+                FROM work_entries
+                WHERE employee_name = ? AND work_date = ? AND project_name = ? AND task_name = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (values["employee_name"], values["work_date"], values["project_name"], values["task_name"]),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO work_entries (employee_name, work_date, project_name, task_name, hours_spent)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        values["employee_name"],
+                        values["work_date"],
+                        values["project_name"],
+                        values["task_name"],
+                        values["hours_spent"],
+                    ),
+                )
+                entry_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                _insert_change_sqlite(conn, entry_id, "IMPORT_CREATE", operator, None, values)
+                created += 1
+                continue
+
+            if not overwrite:
+                skipped += 1
+                continue
+
+            old_values = {
+                "employee_name": row["employee_name"],
+                "work_date": row["work_date"],
+                "project_name": row["project_name"],
+                "task_name": row["task_name"],
+                "hours_spent": float(row["hours_spent"]),
+            }
+            if abs(float(old_values["hours_spent"]) - float(values["hours_spent"])) < 0.000001:
+                skipped += 1
+                continue
+            conn.execute("UPDATE work_entries SET hours_spent = ? WHERE id = ?", (values["hours_spent"], int(row["id"])))
+            _insert_change_sqlite(conn, int(row["id"]), "IMPORT_OVERWRITE", operator, old_values, values)
+            updated += 1
+        conn.commit()
+    return {"total_rows": len(entries), "created": created, "updated": updated, "skipped": skipped}
+
+
 def _insert_change_sqlite(
     conn: sqlite3.Connection,
     entry_id: int | None,
