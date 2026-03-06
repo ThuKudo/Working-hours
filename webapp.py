@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import webbrowser
 from datetime import datetime
@@ -13,7 +14,8 @@ from openpyxl import Workbook, load_workbook
 HOST = "127.0.0.1"
 PORT = 8000
 BASE_DIR = Path(__file__).resolve().parent
-CONTACTS_XLSX = BASE_DIR / "contacts.xlsx"
+RUNTIME_DATA_DIR = Path("/tmp") if os.environ.get("VERCEL") else BASE_DIR
+CONTACTS_XLSX = RUNTIME_DATA_DIR / "contacts.xlsx"
 
 STORE_DATA = {
     "company": {
