@@ -112,13 +112,18 @@ def fetch_filters(sqlite_db_path: Path) -> dict:
 
 
 def fetch_entries(sqlite_db_path: Path, month: str, project: str) -> list[dict]:
+    is_all_months = (not month) or month.lower() == "all"
+
     if USE_POSTGRES:
         query = """
             SELECT id, work_date, employee_name, project_name, task_name, hours_spent
             FROM work_entries
-            WHERE substring(work_date, 1, 7) = %s
+            WHERE 1 = 1
         """
-        params: list[Any] = [month]
+        params: list[Any] = []
+        if not is_all_months:
+            query += " AND substring(work_date, 1, 7) = %s"
+            params.append(month)
         if project and project != ALL_PROJECTS:
             query += " AND project_name = %s"
             params.append(project)
@@ -142,9 +147,12 @@ def fetch_entries(sqlite_db_path: Path, month: str, project: str) -> list[dict]:
     query = """
         SELECT id, work_date, employee_name, project_name, task_name, hours_spent
         FROM work_entries
-        WHERE substr(work_date, 1, 7) = ?
+        WHERE 1 = 1
     """
-    params2: list[Any] = [month]
+    params2: list[Any] = []
+    if not is_all_months:
+        query += " AND substr(work_date, 1, 7) = ?"
+        params2.append(month)
     if project and project != ALL_PROJECTS:
         query += " AND project_name = ?"
         params2.append(project)
@@ -237,6 +245,8 @@ def fetch_monthly_summary(sqlite_db_path: Path) -> list[list]:
 
 
 def fetch_history_rows(sqlite_db_path: Path, month: str | None, project: str | None, limit: int = 40) -> list[dict]:
+    is_all_months = (not month) or month.lower() == "all"
+
     if USE_POSTGRES:
         query = """
             SELECT id, entry_id, action, changed_by, employee_name, work_date, project_name, task_name, hours_spent, changed_at
@@ -244,7 +254,7 @@ def fetch_history_rows(sqlite_db_path: Path, month: str | None, project: str | N
             WHERE 1 = 1
         """
         params: list[Any] = []
-        if month:
+        if not is_all_months:
             query += " AND substring(work_date, 1, 7) = %s"
             params.append(month)
         if project and project != ALL_PROJECTS:
@@ -278,7 +288,7 @@ def fetch_history_rows(sqlite_db_path: Path, month: str | None, project: str | N
         WHERE 1 = 1
     """
     params2: list[Any] = []
-    if month:
+    if not is_all_months:
         query2 += " AND substr(work_date, 1, 7) = ?"
         params2.append(month)
     if project and project != ALL_PROJECTS:
